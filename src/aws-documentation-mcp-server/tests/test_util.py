@@ -21,8 +21,10 @@ from awslabs.aws_documentation_mcp_server.util import (
     enforce_redirect_allowlist,
     extract_content_from_html,
     extract_sections_from_html,
+    extract_sections_from_markdown,
     format_documentation_result,
     is_html_content,
+    normalize_md_links,
     parse_recommendation_results,
     url_matches_allowlist,
 )
@@ -894,3 +896,101 @@ class TestExtractSectionsFromHtml:
         assert '<h2>Main Section</h2>' in result
         assert 'First main content' in result
         assert 'Second main content' in result  # Should include both matching sections
+
+
+class TestExtractSectionsFromMarkdown:
+    """Tests for extract_sections_from_markdown — mirrors the HTML slicer's contract."""
+
+    SAMPLE = (
+        '# Page Title\n<a name="top"></a>\n\n'
+        '## Introduction\n<a name="intro"></a>\n\nIntro content.\n\n'
+        '## Main Section\n<a name="main"></a>\n\nMain content.\n\n'
+        '### Subsection\n<a name="sub"></a>\n\nSub content.\n\n'
+        '## Other Section\n\nShould not be included.\n'
+    )
+
+    def test_extracts_requested_section(self):
+        """A matched ## section is returned; unmatched sections are excluded."""
+        result = extract_sections_from_markdown(self.SAMPLE, ['Introduction'])
+        assert 'Intro content.' in result
+        assert 'Should not be included.' not in result
+
+    def test_includes_deeper_subsections(self):
+        """A matched section includes its ### subsections up to the next ## boundary."""
+        result = extract_sections_from_markdown(self.SAMPLE, ['Main Section'])
+        assert 'Main content.' in result
+        assert '### Subsection' in result
+        assert 'Sub content.' in result
+        assert 'Other Section' not in result
+
+    def test_case_insensitive_and_whitespace_normalized(self):
+        """Matching ignores case and collapses whitespace."""
+        result = extract_sections_from_markdown(self.SAMPLE, ['  MAIN   section '])
+        assert 'Main content.' in result
+
+    def test_matches_heading_with_anchor_suffix(self):
+        """A `## Title {#anchor}` heading matches on the title text alone."""
+        md = '## Quotas {#limits}\n\nBody.\n'
+        result = extract_sections_from_markdown(md, ['Quotas'])
+        assert 'Body.' in result
+
+    def test_no_match_raises_with_available_sections(self):
+        """No match raises ValueError listing the available ## sections."""
+        with pytest.raises(ValueError) as exc:
+            extract_sections_from_markdown(self.SAMPLE, ['Nonexistent'])
+        msg = str(exc.value)
+        assert 'No matching sections were found' in msg
+        assert '"Introduction"' in msg and '"Main Section"' in msg
+
+    def test_no_subsections_raises(self):
+        """A document with no ## headings raises the no-subsections error."""
+        with pytest.raises(ValueError) as exc:
+            extract_sections_from_markdown('# Only H1\n\nText.\n', ['Anything'])
+        assert 'does not contain subsections' in str(exc.value)
+
+    def test_partial_match_appends_note(self):
+        """Found sections return, with a note listing the missing ones."""
+        result = extract_sections_from_markdown(self.SAMPLE, ['Introduction', 'Missing One'])
+        assert 'Intro content.' in result
+        assert 'were not found: "Missing One"' in result
+
+    def test_empty_inputs(self):
+        """Empty content or empty titles returns the guard message."""
+        assert extract_sections_from_markdown('', ['x']) == 'No content or section titles provided'
+        assert (
+            extract_sections_from_markdown('## A\n\nx', [])
+            == 'No content or section titles provided'
+        )
+
+
+class TestNormalizeMdLinks:
+    """normalize_md_links rewrites in-body markdown link targets from .md to .html."""
+
+    def test_relative_link_rewritten(self):
+        """A relative .md link target becomes .html."""
+        assert normalize_md_links('see [x](quotas-runtime.md).') == 'see [x](quotas-runtime.html).'
+
+    def test_anchored_link_preserves_anchor(self):
+        """An anchored .md link keeps its #anchor."""
+        assert normalize_md_links('[a](naming.md#alias)') == '[a](naming.html#alias)'
+
+    def test_absolute_link_rewritten(self):
+        """An absolute docs .md link target becomes .html."""
+        src = '[x](https://docs.aws.amazon.com/s3/latest/userguide/x.md)'
+        assert (
+            normalize_md_links(src)
+            == '[x](https://docs.aws.amazon.com/s3/latest/userguide/x.html)'
+        )
+
+    def test_multiple_links(self):
+        """All link targets on a line are rewritten."""
+        assert normalize_md_links('[a](a.md) [b](b.md#c)') == '[a](a.html) [b](b.html#c)'
+
+    def test_prose_and_code_untouched(self):
+        """Bare .md in prose or code is not a link target and is left alone."""
+        src = "mentions file.md and n.md; code `open('a.md')`"
+        assert normalize_md_links(src) == src
+
+    def test_existing_html_link_unchanged(self):
+        """An existing .html link is unchanged."""
+        assert normalize_md_links('[y](foo.html)') == '[y](foo.html)'

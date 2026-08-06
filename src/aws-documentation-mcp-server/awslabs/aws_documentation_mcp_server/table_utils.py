@@ -115,6 +115,151 @@ def parse_html_tables(html: str, section_title: Optional[str] = None) -> Optiona
     return {'tables': parsed_tables}
 
 
+def _split_pipe_row(line: str) -> list[str]:
+    """Split a GFM pipe-table row into trimmed cell strings, tolerating optional edge pipes."""
+    stripped = line.strip()
+    if stripped.startswith('|'):
+        stripped = stripped[1:]
+    if stripped.endswith('|'):
+        stripped = stripped[:-1]
+    return [c.strip() for c in stripped.split('|')]
+
+
+def _is_pipe_separator(line: str) -> bool:
+    """True if the line is a GFM header separator row (e.g. `| --- | :--: |`)."""
+    stripped = line.strip()
+    if '|' not in stripped or '-' not in stripped:
+        return False
+    return bool(re.fullmatch(r'\|?[\s|:-]+\|?', stripped)) and any(
+        set(cell.strip()) <= {'-', ':'} and '-' in cell for cell in _split_pipe_row(line)
+    )
+
+
+def _clean_md_cell(cell: str) -> str:
+    """Normalize a markdown table cell: drop in-cell <br> line breaks; keep markdown links."""
+    return ' '.join(re.sub(r'<br\s*/?>', ' ', cell).split())
+
+
+def _parse_pipe_table(lines: list[str]) -> Optional[dict]:
+    """Parse a GFM pipe table (header, separator, data rows) into flat {columns, rows}.
+
+    Pipe tables cannot express colspan/rowspan, so the result is always flat — no parent/child
+    nesting. In-cell `<br>` is collapsed to spaces; markdown links are left intact.
+    """
+    if len(lines) < 2:
+        return None
+    headers = _deduplicate_headers([_clean_md_cell(c) for c in _split_pipe_row(lines[0])])
+    if not headers:
+        return None
+    rows: list[dict[str, object]] = []
+    for line in lines[2:]:
+        cells = [_clean_md_cell(c) for c in _split_pipe_row(line)]
+        # Pad/truncate to the header width so ragged rows still map cleanly.
+        cells = (cells + [''] * len(headers))[: len(headers)]
+        rows.append({headers[i]: cells[i] for i in range(len(headers))})
+    if not rows:
+        return None
+    return {'columns': headers, 'rows': rows}
+
+
+def parse_markdown_tables(markdown: str, section_title: Optional[str] = None) -> Optional[dict]:
+    """Extract tables from native markdown, mirroring parse_html_tables' return contract.
+
+    Handles both GFM pipe tables (flat) and raw `<table>` blocks the docs markdown build emits
+    for complex/merged tables (delegated to the HTML table parser). Section scoping matches a
+    `##`/`###` heading (case-insensitive) and collects tables until the next same-or-higher
+    heading. Returns the same dict shapes as parse_html_tables (single table, `tables` list,
+    `error`, or None).
+    """
+    lines = markdown.split('\n')
+
+    heading_re = re.compile(r'^(#{1,6})\s+(.+?)(?:\s*\{#[^}]+\})?\s*$')
+
+    if section_title is None:
+        window = (0, len(lines))
+        available_sections: list[str] = []
+    else:
+        normalized_target = ' '.join(section_title.strip().lower().split())
+        available_sections = []
+        start = end = None
+        target_level = 0
+        for i, line in enumerate(lines):
+            m = heading_re.match(line)
+            if not m:
+                continue
+            level = len(m.group(1))
+            text = m.group(2).strip()
+            available_sections.append(text)
+            if start is None and ' '.join(text.lower().split()) == normalized_target:
+                start, target_level = i, level
+            elif start is not None and end is None and level <= target_level:
+                end = i
+        if start is None:
+            return {
+                'error': f'Section "{section_title}" not found',
+                'available_sections': available_sections,
+            }
+        window = (start, end if end is not None else len(lines))
+
+    parsed_tables = _collect_markdown_tables(lines, window, heading_re)
+
+    if not parsed_tables:
+        if section_title is not None:
+            return {
+                'error': f'No table found in section "{section_title}"',
+                'available_sections': available_sections,
+            }
+        return None
+
+    if len(parsed_tables) == 1 and section_title is not None:
+        return parsed_tables[0]
+    return {'tables': parsed_tables, 'detected_section': section_title}
+
+
+def _collect_markdown_tables(lines, window, heading_re) -> list[dict]:
+    """Collect flat pipe tables and embedded raw <table> blocks within a line window."""
+    start, end = window
+    parsed_tables: list[dict] = []
+    last_heading: Optional[str] = None
+    i = start
+    while i < end:
+        line = lines[i]
+        m = heading_re.match(line)
+        if m:
+            last_heading = m.group(2).strip()
+            i += 1
+            continue
+        # Raw <table> block emitted by the markdown build for complex tables.
+        if '<table' in line.lower():
+            depth_start = i
+            while i < end and '</table>' not in lines[i].lower():
+                i += 1
+            html_block = '\n'.join(lines[depth_start : i + 1])
+            soup = BeautifulSoup(html_block, 'html.parser')
+            for tbl in soup.find_all('table'):
+                if isinstance(tbl, Tag):
+                    data = _extract_table_data(tbl)
+                    if data and 'rows' in data:
+                        data['table_heading'] = last_heading
+                        parsed_tables.append(data)
+            i += 1
+            continue
+        # GFM pipe table: a `|` line followed by a separator row.
+        if line.strip().startswith('|') and i + 1 < end and _is_pipe_separator(lines[i + 1]):
+            block = [line, lines[i + 1]]
+            i += 2
+            while i < end and lines[i].strip().startswith('|'):
+                block.append(lines[i])
+                i += 1
+            data = _parse_pipe_table(block)
+            if data:
+                data['table_heading'] = last_heading
+                parsed_tables.append(data)
+            continue
+        i += 1
+    return parsed_tables
+
+
 def _find_all_tables(soup: BeautifulSoup) -> Optional[dict]:
     """Parse all tables on the page and return them separately."""
     tables = [t for t in soup.find_all('table') if isinstance(t, Tag)]

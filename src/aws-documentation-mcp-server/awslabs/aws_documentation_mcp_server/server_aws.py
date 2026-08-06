@@ -179,7 +179,8 @@ async def read_documentation(
         Markdown content of the AWS documentation
     """
     # Validate that URL is from docs.aws.amazon.com and ends with .html
-    url_str = str(url)
+    # Accept the .md variant and canonicalize to .html (the tool fetches .md internally).
+    url_str = re.sub(r'\.md$', '.html', str(url))
 
     supported_domains_regex = [r'^https?://docs\.aws\.amazon\.com/']
     for modifier in SEARCH_TERM_DOMAIN_MODIFIERS:
@@ -255,7 +256,8 @@ async def read_sections(
         Filtered markdown content containing only the requested sections
     """
     # Validate that URL is from docs.aws.amazon.com and ends with .html
-    url_str = str(url)
+    # Accept the .md variant and canonicalize to .html (the tool fetches .md internally).
+    url_str = re.sub(r'\.md$', '.html', str(url))
 
     supported_domains_regex = [r'^https?://docs\.aws\.amazon\.com/']
     for modifier in SEARCH_TERM_DOMAIN_MODIFIERS:
@@ -360,7 +362,8 @@ async def search_table(
     Returns:
         SearchTableResponse with matching rows grouped by table
     """
-    url_str = str(url)
+    # Accept the .md variant and canonicalize to .html (the tool fetches .md internally).
+    url_str = re.sub(r'\.md$', '.html', str(url))
 
     supported_domains_regex = [r'^https?://docs\.aws\.amazon\.com/']
     for modifier in SEARCH_TERM_DOMAIN_MODIFIERS:

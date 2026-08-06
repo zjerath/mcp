@@ -16,6 +16,7 @@
 from awslabs.aws_documentation_mcp_server.table_utils import (
     filter_table_rows,
     parse_html_tables,
+    parse_markdown_tables,
 )
 from awslabs.aws_documentation_mcp_server.util import truncate_large_tables
 
@@ -1213,3 +1214,92 @@ class TestMaxRowsCapping:
         matches = filter_table_rows(rows, 'RunInstances')
         assert len(matches) == 1
         assert matches[0]['Action'] == 'RunInstances'
+
+
+class TestParseMarkdownTables:
+    """Tests for parse_markdown_tables (GFM pipe tables + embedded raw <table> blocks)."""
+
+    PIPE = (
+        '# Page\n\n'
+        '## Endpoints\n<a name="e"></a>\n\n'
+        '| Region | Endpoint | Protocol |\n'
+        '| --- | --- | --- |\n'
+        '| us-east-1 | a.example.com <br /> b.example.com | HTTPS<br />HTTPS |\n'
+        '| us-west-2 | c.example.com | HTTPS |\n\n'
+        '## Quotas\n\n'
+        '| Name | Value |\n'
+        '| --- | --- |\n'
+        '| Jobs | [Yes](https://x/y) |\n'
+    )
+
+    def test_pipe_table_flat_columns_and_rows(self):
+        """A pipe table parses to flat columns and rows."""
+        result = parse_markdown_tables(self.PIPE, 'Endpoints')
+        table = result if 'columns' in result else result['tables'][0]
+        assert table['columns'] == ['Region', 'Endpoint', 'Protocol']
+        assert len(table['rows']) == 2
+        assert table['rows'][0]['Region'] == 'us-east-1'
+
+    def test_in_cell_br_collapsed_to_space(self):
+        """<br> inside a cell is collapsed so the values stay in one cell."""
+        result = parse_markdown_tables(self.PIPE, 'Endpoints')
+        table = result if 'columns' in result else result['tables'][0]
+        assert table['rows'][0]['Endpoint'] == 'a.example.com b.example.com'
+        assert '<br' not in table['rows'][0]['Protocol']
+
+    def test_markdown_link_preserved_in_cell(self):
+        """Markdown links inside cells are preserved verbatim."""
+        result = parse_markdown_tables(self.PIPE, 'Quotas')
+        table = result if 'columns' in result else result['tables'][0]
+        assert table['rows'][0]['Value'] == '[Yes](https://x/y)'
+
+    def test_section_scoping_excludes_other_sections(self):
+        """Section scoping returns only tables under the requested heading."""
+        result = parse_markdown_tables(self.PIPE, 'Quotas')
+        table = result if 'columns' in result else result['tables'][0]
+        assert table['columns'] == ['Name', 'Value']
+
+    def test_section_not_found_returns_error_contract(self):
+        """A missing section returns the error/available_sections contract."""
+        result = parse_markdown_tables(self.PIPE, 'Nonexistent')
+        assert 'error' in result and 'available_sections' in result
+        assert 'Endpoints' in result['available_sections']
+
+    def test_embedded_raw_table_parsed(self):
+        """A raw <table> block in markdown is parsed via the HTML table parser."""
+        md = (
+            '## Bandwidth\n\n'
+            '<table><thead><tr><th>Instance</th><th>Mbps</th></tr></thead>'
+            '<tbody><tr><td>a1.large</td><td>525</td></tr></tbody></table>\n'
+        )
+        result = parse_markdown_tables(md, 'Bandwidth')
+        table = result if 'columns' in result else result['tables'][0]
+        assert table['columns'] == ['Instance', 'Mbps']
+        assert table['rows'][0]['Instance'] == 'a1.large'
+
+    def test_no_tables_returns_none_without_section(self):
+        """A page with no tables and no section filter returns None."""
+        assert parse_markdown_tables('# Title\n\nJust prose.\n', None) is None
+
+    def test_all_tables_when_section_none(self):
+        """With no section filter, all tables on the page are collected."""
+        result = parse_markdown_tables(self.PIPE, None)
+        assert 'tables' in result
+        assert len(result['tables']) == 2
+
+    def test_pipe_table_header_only_no_rows(self):
+        """A pipe table with a header and separator but no data rows yields no table."""
+        md = '## S\n\n| A | B |\n| --- | --- |\n'
+        assert parse_markdown_tables(md, 'S')['error'].startswith('No table found')
+
+    def test_pipe_line_without_separator_ignored(self):
+        """A `|` line not followed by a separator row is not treated as a table."""
+        md = '## S\n\n| not a table | just pipes |\nregular text\n'
+        assert parse_markdown_tables(md, 'S')['error'].startswith('No table found')
+
+    def test_unclosed_raw_table_does_not_hang(self):
+        """An unterminated <table> block is consumed to end-of-window without error."""
+        md = '## S\n\n<table><thead><tr><th>A</th></tr></thead><tbody><tr><td>x</td></tr>'
+        result = parse_markdown_tables(md, 'S')
+        # Either parses what it can or reports no table; must not raise.
+        assert isinstance(result, dict)

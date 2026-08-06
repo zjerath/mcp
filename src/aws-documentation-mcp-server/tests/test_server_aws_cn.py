@@ -65,7 +65,7 @@ class TestReadDocumentationChina:
                     'https://docs.amazonaws.cn/en_us/AmazonS3/latest/userguide/test.html' in result
                 )
                 assert '# Test\n\nThis is a test.' in result
-                mock_get.assert_called_once()
+                # .md probe returns non-markdown here, so we fall back to fetching .html.
                 mock_extract.assert_called_once()
 
     @pytest.mark.asyncio
@@ -103,7 +103,8 @@ class TestReadDocumentationChina:
 
             assert 'Failed to fetch' in result
             assert 'Connection error' in result
-            mock_get.assert_called_once()
+            # .md probe and .html fallback both raise; the .html error is surfaced.
+            assert mock_get.called
 
 
 class TestGetAvailableServices:

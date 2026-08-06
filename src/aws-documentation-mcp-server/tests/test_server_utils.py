@@ -79,8 +79,8 @@ class TestReadDocumentationImpl:
                 # Verify the result
                 assert result == 'AWS Documentation from URL: # Test\n\nContent'
 
-                # Verify the mock was called correctly
-                mock_client.get.assert_called_once_with(
+                # The .md probe returns non-markdown here, so we fall back to fetching .html.
+                mock_client.get.assert_any_call(
                     f'{url}?session=test-uuid',
                     follow_redirects=True,
                     headers={
@@ -370,8 +370,8 @@ class TestReadDocumentationImpl:
                 # Verify the result
                 assert result == 'AWS Documentation from URL: # Test\n\nContent'
 
-                # Verify the mock was called correctly
-                mock_client.get.assert_called_once_with(
+                # The cached query_id is appended on the .html fallback fetch.
+                mock_client.get.assert_any_call(
                     f'{url}?session=test-uuid&query_id=test-query-id',
                     follow_redirects=True,
                     headers={
@@ -538,6 +538,297 @@ class TestRedirectAllowlistEnforcement:
         )
         assert 'SENSITIVE-IMDS-DATA' not in (result.error or '')
         assert result.error and 'Failed to fetch' in result.error
+
+
+class TestMarkdownEndpointPreference:
+    """read_documentation prefers the .md endpoint and falls back to .html when needed.
+
+    Uses httpx.MockTransport with the real client so the actual .md-first / fallback logic
+    runs. The agent always passes the .html URL; the .md swap is internal.
+    """
+
+    def _md(self, body='# Title\n\nBody text.\n'):
+        return httpx.Response(200, text=body, headers={'content-type': 'text/markdown'})
+
+    def _html(self, body='<html><body><h1>HTML</h1></body></html>'):
+        return httpx.Response(200, text=body, headers={'content-type': 'text/html'})
+
+    @pytest.mark.asyncio
+    async def test_md_served_directly_when_available(self, monkeypatch):
+        """A 200 text/markdown .md response is returned as-is, no HTML fetch."""
+        ctx = MagicMock(spec=Context)
+        ctx.error = AsyncMock()
+        calls = []
+
+        def routes(request: httpx.Request) -> httpx.Response:
+            calls.append(request.url.path)
+            return self._md('# Native MD\n\nFrom the markdown endpoint.\n')
+
+        _install_mock_transport(
+            monkeypatch, routes, 'awslabs.aws_documentation_mcp_server.server_utils'
+        )
+        result = await read_documentation_impl(
+            ctx, 'https://docs.aws.amazon.com/test.html', 10000, 0, 'uuid'
+        )
+        assert 'From the markdown endpoint.' in result
+        # Only the .md URL was fetched; no .html fallback.
+        assert calls == ['/test.md']
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_html_on_md_404(self, monkeypatch):
+        """A 404 on .md falls back to fetching and converting .html."""
+        ctx = MagicMock(spec=Context)
+        ctx.error = AsyncMock()
+        paths = []
+
+        def routes(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
+            if request.url.path.endswith('.md'):
+                return httpx.Response(404, text='not found')
+            return self._html('<html><body><h1>HTML fallback</h1></body></html>')
+
+        _install_mock_transport(
+            monkeypatch, routes, 'awslabs.aws_documentation_mcp_server.server_utils'
+        )
+        result = await read_documentation_impl(
+            ctx, 'https://docs.aws.amazon.com/test.html', 10000, 0, 'uuid'
+        )
+        assert '/test.md' in paths and '/test.html' in paths
+        assert 'HTML fallback' in result
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_html_on_non_markdown_content_type(self, monkeypatch):
+        """A 200 .md with a non-markdown content-type falls back to .html."""
+        ctx = MagicMock(spec=Context)
+        ctx.error = AsyncMock()
+
+        def routes(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith('.md'):
+                return httpx.Response(200, text='oops', headers={'content-type': 'text/html'})
+            return self._html('<html><body><h1>HTML fallback</h1></body></html>')
+
+        _install_mock_transport(
+            monkeypatch, routes, 'awslabs.aws_documentation_mcp_server.server_utils'
+        )
+        result = await read_documentation_impl(
+            ctx, 'https://docs.aws.amazon.com/test.html', 10000, 0, 'uuid'
+        )
+        assert 'HTML fallback' in result
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_html_on_degraded_markdown(self, monkeypatch):
+        """A .md body containing the degradation sentinel falls back to .html."""
+        ctx = MagicMock(spec=Context)
+        ctx.error = AsyncMock()
+
+        def routes(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith('.md'):
+                return self._md(
+                    '# Quotas\n\n| Name | Value |\n| --- | --- |\n'
+                    '| x | See the AWS documentation website for more details |\n'
+                )
+            return self._html('<html><body><h1>HTML fallback</h1></body></html>')
+
+        _install_mock_transport(
+            monkeypatch, routes, 'awslabs.aws_documentation_mcp_server.server_utils'
+        )
+        result = await read_documentation_impl(
+            ctx, 'https://docs.aws.amazon.com/quotas.html', 10000, 0, 'uuid'
+        )
+        assert 'HTML fallback' in result
+
+    @pytest.mark.asyncio
+    async def test_md_large_table_still_truncated(self, monkeypatch):
+        """truncate_large_tables runs on the .md path, emitting the search_table hint."""
+        ctx = MagicMock(spec=Context)
+        ctx.error = AsyncMock()
+        rows = '\n'.join(f'| r{i} | v{i} |' for i in range(30))
+        md = f'# Page\n\n| Col A | Col B |\n| --- | --- |\n{rows}\n'
+
+        def routes(request: httpx.Request) -> httpx.Response:
+            return self._md(md)
+
+        _install_mock_transport(
+            monkeypatch, routes, 'awslabs.aws_documentation_mcp_server.server_utils'
+        )
+        result = await read_documentation_impl(
+            ctx, 'https://docs.aws.amazon.com/big-table.html', 100000, 0, 'uuid'
+        )
+        assert 'Table truncated' in result and 'search_table' in result
+
+
+class TestReadSectionsMarkdownEndpoint:
+    """read_sections slices from the .md endpoint and falls back to .html when needed."""
+
+    MD_PAGE = (
+        '# S3 Bucket Guide\n<a name="top"></a>\n\n'
+        '## Bucket Naming Rules\n<a name="rules"></a>\n\nNames must be lowercase.\n\n'
+        '## Examples\n<a name="ex"></a>\n\nmy-bucket-name\n\n'
+        '## Other Information\n\nShould not appear.\n'
+    )
+
+    @pytest.mark.asyncio
+    async def test_slices_sections_from_markdown(self, monkeypatch):
+        """A .md page is sliced natively; only requested sections are returned."""
+        ctx = MagicMock(spec=Context)
+        ctx.error = AsyncMock()
+        paths = []
+
+        def routes(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
+            return httpx.Response(
+                200, text=self.MD_PAGE, headers={'content-type': 'text/markdown'}
+            )
+
+        _install_mock_transport(
+            monkeypatch, routes, 'awslabs.aws_documentation_mcp_server.server_utils'
+        )
+        result = await read_sections_impl(
+            ctx, 'https://docs.aws.amazon.com/test.html', ['Bucket Naming Rules'], 'uuid'
+        )
+        assert 'Names must be lowercase.' in result
+        assert 'Should not appear.' not in result
+        # Sliced from the .md endpoint; no .html fetch.
+        assert paths == ['/test.md']
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_html_when_md_missing(self, monkeypatch):
+        """A 404 on .md falls back to HTML section extraction."""
+        ctx = MagicMock(spec=Context)
+        ctx.error = AsyncMock()
+
+        def routes(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith('.md'):
+                return httpx.Response(404, text='nope')
+            return httpx.Response(
+                200,
+                text='<html><body><h2>Intro</h2><p>HTML section body.</p></body></html>',
+                headers={'content-type': 'text/html'},
+            )
+
+        _install_mock_transport(
+            monkeypatch, routes, 'awslabs.aws_documentation_mcp_server.server_utils'
+        )
+        result = await read_sections_impl(
+            ctx, 'https://docs.aws.amazon.com/test.html', ['Intro'], 'uuid'
+        )
+        assert 'HTML section body.' in result
+
+    @pytest.mark.asyncio
+    async def test_no_match_raises_on_markdown_path(self, monkeypatch):
+        """A no-match on the .md path raises with the available sections."""
+        ctx = MagicMock(spec=Context)
+        ctx.error = AsyncMock()
+
+        def routes(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, text=self.MD_PAGE, headers={'content-type': 'text/markdown'}
+            )
+
+        _install_mock_transport(
+            monkeypatch, routes, 'awslabs.aws_documentation_mcp_server.server_utils'
+        )
+        with pytest.raises(ValueError, match='No matching sections were found'):
+            await read_sections_impl(
+                ctx, 'https://docs.aws.amazon.com/test.html', ['Nonexistent'], 'uuid'
+            )
+
+
+class TestSearchTableMarkdownEndpoint:
+    """search_table parses tables from the .md endpoint and falls back to .html when needed."""
+
+    PIPE_MD = (
+        '# Quotas Page\n\n'
+        '## Service quotas\n<a name="q"></a>\n\n'
+        '| Name | Default | Adjustable |\n'
+        '| --- | --- | --- |\n'
+        '| Active jobs | 20 | [Yes](https://console.aws.amazon.com/x) |\n'
+        '| Inactive jobs | 5000 | No |\n'
+    )
+
+    RAW_TABLE_MD = (
+        '# Bandwidth\n\n'
+        '## Instance bandwidth\n\n'
+        '<table><thead><tr><th>Instance</th><th>Mbps</th></tr></thead>'
+        '<tbody><tr><td>a1.large</td><td>525</td></tr>'
+        '<tr><td>m5.large</td><td>650</td></tr></tbody></table>\n'
+    )
+
+    @pytest.mark.asyncio
+    async def test_parses_pipe_table_from_markdown(self, monkeypatch):
+        """A GFM pipe table on the .md endpoint is parsed and filtered."""
+        from awslabs.aws_documentation_mcp_server.server_utils import search_table_impl
+
+        ctx = MagicMock(spec=Context)
+        ctx.error = AsyncMock()
+        paths = []
+
+        def routes(request: httpx.Request) -> httpx.Response:
+            paths.append(request.url.path)
+            return httpx.Response(
+                200, text=self.PIPE_MD, headers={'content-type': 'text/markdown'}
+            )
+
+        _install_mock_transport(
+            monkeypatch, routes, 'awslabs.aws_documentation_mcp_server.server_utils'
+        )
+        result = await search_table_impl(
+            ctx, 'https://docs.aws.amazon.com/quotas.html', 'Service quotas', 'Active', 20, 'uuid'
+        )
+        assert paths == ['/quotas.md']
+        assert result.tables_with_matches == 1
+        assert result.results[0].columns == ['Name', 'Default', 'Adjustable']
+        assert result.results[0].matched_rows == 1
+
+    @pytest.mark.asyncio
+    async def test_parses_embedded_raw_table_from_markdown(self, monkeypatch):
+        """A complex table emitted as raw <table> in .md is parsed via the HTML table parser."""
+        from awslabs.aws_documentation_mcp_server.server_utils import search_table_impl
+
+        ctx = MagicMock(spec=Context)
+        ctx.error = AsyncMock()
+
+        def routes(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, text=self.RAW_TABLE_MD, headers={'content-type': 'text/markdown'}
+            )
+
+        _install_mock_transport(
+            monkeypatch, routes, 'awslabs.aws_documentation_mcp_server.server_utils'
+        )
+        result = await search_table_impl(
+            ctx, 'https://docs.aws.amazon.com/bw.html', 'Instance bandwidth', 'm5', 20, 'uuid'
+        )
+        assert result.tables_with_matches == 1
+        assert result.results[0].matched_rows == 1
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_html_on_md_404(self, monkeypatch):
+        """A 404 on .md falls back to parsing the .html table."""
+        from awslabs.aws_documentation_mcp_server.server_utils import search_table_impl
+
+        ctx = MagicMock(spec=Context)
+        ctx.error = AsyncMock()
+
+        def routes(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith('.md'):
+                return httpx.Response(404, text='nope')
+            return httpx.Response(
+                200,
+                text=(
+                    '<html><body><h2>S</h2><table><thead><tr><th>Name</th></tr></thead>'
+                    '<tbody><tr><td>alpha</td></tr></tbody></table></body></html>'
+                ),
+                headers={'content-type': 'text/html'},
+            )
+
+        _install_mock_transport(
+            monkeypatch, routes, 'awslabs.aws_documentation_mcp_server.server_utils'
+        )
+        result = await search_table_impl(
+            ctx, 'https://docs.aws.amazon.com/x.html', 'S', 'alpha', 20, 'uuid'
+        )
+        assert result.tables_with_matches == 1
 
 
 class TestUserAgentCustomization:

@@ -13,6 +13,7 @@
 # limitations under the License.
 import httpx
 import os
+import re
 from awslabs.aws_documentation_mcp_server.models import (
     SearchResponse,
     SearchTableResponse,
@@ -22,8 +23,10 @@ from awslabs.aws_documentation_mcp_server.util import (
     enforce_redirect_allowlist,
     extract_content_from_html,
     extract_sections_from_html,
+    extract_sections_from_markdown,
     format_documentation_result,
     is_html_content,
+    normalize_md_links,
     truncate_large_tables,
 )
 from collections import deque
@@ -48,6 +51,10 @@ def _docs_client(allowed_domain_regexes: Sequence[str]) -> httpx.AsyncClient:
     )
 
 
+# Marks a table cell whose block content the markdown build dropped; triggers HTML fallback.
+_MARKDOWN_DEGRADED_SENTINEL = 'See the AWS documentation website for more details'
+
+
 try:
     __version__ = version('awslabs.aws-documentation-mcp-server')
 except Exception:
@@ -64,6 +71,51 @@ DEFAULT_USER_AGENT = (
 )
 
 
+def _append_session_params(url_str: str, session_uuid: str) -> str:
+    """Append the session (and cached query_id, if any) params to a fetch URL."""
+    url_with_session = f'{url_str}?session={session_uuid}'
+    query_id = get_query_id_from_cache(url_str)
+    if query_id:
+        url_with_session += f'&query_id={query_id}'
+        logger.debug(f'Using query_id {query_id}')
+    return url_with_session
+
+
+async def _fetch_markdown_page(
+    client: httpx.AsyncClient, html_url: str, session_uuid: str, extra_params: str = ''
+) -> Optional[str]:
+    """Fetch the `.md` twin of an `.html` doc page; return its body or None if unusable.
+
+    Returns None (so the caller falls back to the `.html` path) when the `.md` variant is
+    missing, non-markdown, errors, or shows the markdown-build degradation sentinel.
+    `extra_params` is appended to the query string (e.g. read_sections' `&sections=`).
+    """
+    md_url = re.sub(r'\.html$', '.md', html_url)
+    if md_url == html_url:
+        return None
+    try:
+        response = await client.get(
+            _append_session_params(md_url, session_uuid) + extra_params,
+            follow_redirects=True,
+            headers={'User-Agent': DEFAULT_USER_AGENT, 'X-MCP-Session-Id': session_uuid},
+            timeout=30,
+        )
+    except httpx.HTTPError as e:
+        logger.debug(f'Markdown fetch failed for {md_url}, falling back to HTML: {e}')
+        return None
+    if response.status_code != 200 or 'markdown' not in response.headers.get('content-type', ''):
+        logger.debug(
+            f'No usable markdown for {md_url} (status {response.status_code}); using HTML'
+        )
+        return None
+    body = response.text
+    if _MARKDOWN_DEGRADED_SENTINEL in body:
+        logger.debug(f'Markdown for {md_url} is degraded; falling back to HTML')
+        return None
+    # Keep body doc links as .html so agents cite/follow the canonical .html URL.
+    return normalize_md_links(body)
+
+
 async def read_documentation_impl(
     ctx: Context,
     url_str: str,
@@ -72,47 +124,48 @@ async def read_documentation_impl(
     session_uuid: str,
     allowed_domain_regexes: Sequence[str] = COMMERCIAL_ALLOWED_DOMAIN_REGEXES,
 ) -> str:
-    """The implementation of the read_documentation tool."""
+    """The implementation of the read_documentation tool.
+
+    Prefers the docs `.md` endpoint (native markdown, no lossy client-side conversion) and
+    falls back to fetching `.html` and converting when `.md` is unavailable or degraded.
+    """
     logger.debug(f'Fetching documentation from {url_str}')
 
-    url_with_session = f'{url_str}?session={session_uuid}'
-
-    query_id = get_query_id_from_cache(url_str)
-    if query_id:
-        url_with_session += f'&query_id={query_id}'
-        logger.debug(f'Using query_id {query_id}')
-
     async with _docs_client(allowed_domain_regexes) as client:
-        try:
-            response = await client.get(
-                url_with_session,
-                follow_redirects=True,
-                headers={
-                    'User-Agent': DEFAULT_USER_AGENT,
-                    'X-MCP-Session-Id': session_uuid,
-                },
-                timeout=30,
-            )
-        except httpx.HTTPError as e:
-            error_msg = f'Failed to fetch {url_str}: {str(e)}'
-            logger.error(error_msg)
-            await ctx.error(error_msg)
-            return error_msg
+        markdown = await _fetch_markdown_page(client, url_str, session_uuid)
+        if markdown is not None:
+            content = truncate_large_tables(markdown, url=url_str)
+        else:
+            try:
+                response = await client.get(
+                    _append_session_params(url_str, session_uuid),
+                    follow_redirects=True,
+                    headers={
+                        'User-Agent': DEFAULT_USER_AGENT,
+                        'X-MCP-Session-Id': session_uuid,
+                    },
+                    timeout=30,
+                )
+            except httpx.HTTPError as e:
+                error_msg = f'Failed to fetch {url_str}: {str(e)}'
+                logger.error(error_msg)
+                await ctx.error(error_msg)
+                return error_msg
 
-        if response.status_code >= 400:
-            error_msg = f'Failed to fetch {url_str} - status code {response.status_code}'
-            logger.error(error_msg)
-            await ctx.error(error_msg)
-            return error_msg
+            if response.status_code >= 400:
+                error_msg = f'Failed to fetch {url_str} - status code {response.status_code}'
+                logger.error(error_msg)
+                await ctx.error(error_msg)
+                return error_msg
 
-        page_raw = response.text
-        content_type = response.headers.get('content-type', '')
+            page_raw = response.text
+            content_type = response.headers.get('content-type', '')
 
-    if is_html_content(page_raw, content_type):
-        content = extract_content_from_html(page_raw)
-        content = truncate_large_tables(content, url=url_str)
-    else:
-        content = page_raw
+            if is_html_content(page_raw, content_type):
+                content = extract_content_from_html(page_raw)
+                content = truncate_large_tables(content, url=url_str)
+            else:
+                content = page_raw
 
     result = format_documentation_result(url_str, content, start_index, max_length)
 
@@ -174,22 +227,33 @@ async def read_sections_impl(
     session_uuid: str,
     allowed_domain_regexes: Sequence[str] = COMMERCIAL_ALLOWED_DOMAIN_REGEXES,
 ) -> str:
-    """The implementation of the read_sections tool."""
+    """The implementation of the read_sections tool.
+
+    Prefers the docs `.md` endpoint, slicing the requested sections from native markdown, and
+    falls back to fetching `.html` and slicing/converting when `.md` is unavailable or degraded.
+    """
     logger.debug(f'Fetching sections {section_titles} from {url_str}')
 
-    url_with_session = f'{url_str}?session={session_uuid}'
     sections_param = ','.join(quote(title.strip(), safe='') for title in section_titles)
-    url_with_session += f'&sections={sections_param}'
-
-    query_id = get_query_id_from_cache(url_str)
-    if query_id:
-        url_with_session += f'&query_id={query_id}'
-        logger.debug(f'Using query_id {query_id}')
+    sections_query = f'&sections={sections_param}'
 
     async with _docs_client(allowed_domain_regexes) as client:
+        markdown_page = await _fetch_markdown_page(
+            client, url_str, session_uuid, extra_params=sections_query
+        )
+        if markdown_page is not None:
+            try:
+                sliced = extract_sections_from_markdown(markdown_page, section_titles)
+            except ValueError as e:
+                error_msg = str(e)
+                logger.error(error_msg)
+                await ctx.error(error_msg)
+                raise
+            return truncate_large_tables(sliced, url=url_str)
+
         try:
             response = await client.get(
-                url_with_session,
+                _append_session_params(url_str, session_uuid) + sections_query,
                 follow_redirects=True,
                 headers={
                     'User-Agent': DEFAULT_USER_AGENT,
@@ -251,78 +315,85 @@ async def search_table_impl(
     session_uuid: str,
     allowed_domain_regexes: Sequence[str] = COMMERCIAL_ALLOWED_DOMAIN_REGEXES,
 ) -> SearchTableResponse:
-    """The implementation of the search_table tool."""
+    """The implementation of the search_table tool.
+
+    Prefers the docs `.md` endpoint (parsing pipe tables and any embedded raw `<table>` blocks)
+    and falls back to fetching `.html` when `.md` is unavailable or degraded.
+    """
     from awslabs.aws_documentation_mcp_server.table_utils import (  # noqa: E402
         filter_table_rows,
         parse_html_tables,
+        parse_markdown_tables,
     )
 
     logger.debug(f'Searching tables in section "{section_title}" of {url_str} for "{query}"')
 
-    url_with_session = (
-        f'{url_str}?session={session_uuid}&tool=search_table&query={quote(query, safe="")}'
-    )
+    table_query = f'&tool=search_table&query={quote(query, safe="")}'
     if section_title:
-        url_with_session += f'&section={quote(section_title, safe="")}'
-
-    query_id = get_query_id_from_cache(url_str)
-    if query_id:
-        url_with_session += f'&query_id={query_id}'
+        table_query += f'&section={quote(section_title, safe="")}'
 
     async with _docs_client(allowed_domain_regexes) as client:
-        try:
-            response = await client.get(
-                url_with_session,
-                follow_redirects=True,
-                headers={
-                    'User-Agent': DEFAULT_USER_AGENT,
-                    'X-MCP-Session-Id': session_uuid,
-                },
-                timeout=30,
-            )
-        except httpx.HTTPError as e:
-            error_msg = f'Failed to fetch {url_str}: {str(e)}'
-            logger.error(error_msg)
-            await ctx.error(error_msg)
-            return SearchTableResponse(
-                url=url_str,
-                section_title=section_title or '',
-                query=query,
-                tables_searched=0,
-                tables_with_matches=0,
-                results=[],
-                error=error_msg,
-            )
-
-        if response.status_code >= 400:
-            error_msg = f'Failed to fetch {url_str} - status code {response.status_code}'
-            logger.error(error_msg)
-            await ctx.error(error_msg)
-            return SearchTableResponse(
-                url=url_str,
-                section_title=section_title or '',
-                query=query,
-                tables_searched=0,
-                tables_with_matches=0,
-                results=[],
-                error=error_msg,
-            )
-
-        page_raw = response.text
-        content_type = response.headers.get('content-type', '')
-
-    if not is_html_content(page_raw, content_type):
-        return SearchTableResponse(
-            url=url_str,
-            section_title=section_title or '',
-            query=query,
-            tables_searched=0,
-            tables_with_matches=0,
-            results=[],
-            hint='Page content is not HTML. Use read_documentation to view this page.',
+        markdown_page = await _fetch_markdown_page(
+            client, url_str, session_uuid, extra_params=table_query
         )
+        if markdown_page is not None:
+            table_data = parse_markdown_tables(
+                markdown_page, section_title if section_title else None
+            )
+        else:
+            try:
+                response = await client.get(
+                    _append_session_params(url_str, session_uuid) + table_query,
+                    follow_redirects=True,
+                    headers={
+                        'User-Agent': DEFAULT_USER_AGENT,
+                        'X-MCP-Session-Id': session_uuid,
+                    },
+                    timeout=30,
+                )
+            except httpx.HTTPError as e:
+                error_msg = f'Failed to fetch {url_str}: {str(e)}'
+                logger.error(error_msg)
+                await ctx.error(error_msg)
+                return SearchTableResponse(
+                    url=url_str,
+                    section_title=section_title or '',
+                    query=query,
+                    tables_searched=0,
+                    tables_with_matches=0,
+                    results=[],
+                    error=error_msg,
+                )
 
-    table_data = parse_html_tables(page_raw, section_title if section_title else None)
+            if response.status_code >= 400:
+                error_msg = f'Failed to fetch {url_str} - status code {response.status_code}'
+                logger.error(error_msg)
+                await ctx.error(error_msg)
+                return SearchTableResponse(
+                    url=url_str,
+                    section_title=section_title or '',
+                    query=query,
+                    tables_searched=0,
+                    tables_with_matches=0,
+                    results=[],
+                    error=error_msg,
+                )
+
+            page_raw = response.text
+            content_type = response.headers.get('content-type', '')
+
+            if not is_html_content(page_raw, content_type):
+                return SearchTableResponse(
+                    url=url_str,
+                    section_title=section_title or '',
+                    query=query,
+                    tables_searched=0,
+                    tables_with_matches=0,
+                    results=[],
+                    hint='Page content is not HTML. Use read_documentation to view this page.',
+                )
+
+            table_data = parse_html_tables(page_raw, section_title if section_title else None)
 
     if table_data is None:
         return SearchTableResponse(

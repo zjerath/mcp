@@ -162,6 +162,21 @@ def url_matches_allowlist(url: str, allowed_domain_regexes: Sequence[str]) -> bo
     return any(re.match(pattern, url) for pattern in allowed_domain_regexes)
 
 
+# Rewrite the target of a markdown link ending in `.md` (optionally `#anchor`) to `.html`.
+# Matches only the `](target.md)` link syntax so bare `.md` in prose/code is left alone.
+_MD_LINK_TARGET_RE = re.compile(r'(\]\([^)\s]+?)\.md(#[^)\s]*)?\)')
+
+
+def normalize_md_links(markdown: str) -> str:
+    """Rewrite in-body markdown doc links from `.md` back to `.html`.
+
+    The native `.md` endpoint emits internal links as `.md`; the tool contract and citations
+    are `.html`, so an agent following a body link should get an `.html` URL (as it did before
+    the `.md` migration). Only link *targets* are rewritten; `.md` in prose/code is untouched.
+    """
+    return _MD_LINK_TARGET_RE.sub(lambda m: f'{m.group(1)}.html{m.group(2) or ""})', markdown)
+
+
 def enforce_redirect_allowlist(allowed_domain_regexes: Sequence[str]):
     """Build an httpx response event hook that rejects redirects to off-allowlist hosts.
 
@@ -289,6 +304,82 @@ def extract_sections_from_html(html: str, section_titles: List[str]) -> str:
         result_html += f'\n\n<blockquote><strong>Note</strong>: The following requested sections were not found: {missing_list}</blockquote>'
 
     return result_html
+
+
+def _normalize_heading(text: str) -> str:
+    """Lower-case and collapse whitespace for case-insensitive section-title matching."""
+    return ' '.join(text.strip().lower().split())
+
+
+def extract_sections_from_markdown(markdown: str, section_titles: List[str]) -> str:
+    """Extract requested `##` sections from native markdown, mirroring the HTML slicer.
+
+    Matches level-2 (`##`) headings only, case-insensitively and whitespace-normalized. Each
+    matched section spans its heading through the content up to the next `#`/`##` heading, so
+    deeper `###`+ subsections stay included. Raises ValueError with the available sections when
+    nothing matches, and appends a not-found note for partial matches — same contract as
+    `extract_sections_from_html`.
+    """
+    if not markdown or not section_titles:
+        return 'No content or section titles provided'
+
+    normalized_titles = {_normalize_heading(t): t.strip() for t in section_titles}
+
+    # A level-2 heading line: '## Title', tolerating a trailing '{#anchor}'.
+    h2_re = re.compile(r'^##\s+(.+?)(?:\s*\{#[^}]+\})?\s*$')
+    boundary_re = re.compile(r'^#{1,2}\s')
+
+    lines = markdown.split('\n')
+    available_level2 = []
+    matched_blocks = []
+    found_sections = set()
+
+    i = 0
+    while i < len(lines):
+        m = h2_re.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        heading_text = m.group(1).strip()
+        available_level2.append(heading_text)
+        normalized = _normalize_heading(heading_text)
+
+        # Capture this heading through the line before the next h1/h2 boundary.
+        block = [lines[i]]
+        j = i + 1
+        while j < len(lines) and not boundary_re.match(lines[j]):
+            block.append(lines[j])
+            j += 1
+
+        if normalized in normalized_titles:
+            matched_blocks.append('\n'.join(block).rstrip())
+            found_sections.add(normalized_titles[normalized])
+        i = j
+
+    if not found_sections:
+        section_list = ', '.join(f'"{t}"' for t in section_titles)
+        if available_level2:
+            available_list = ', '.join(f'"{s}"' for s in available_level2)
+            raise ValueError(
+                f'No matching sections were found: {section_list}. Available sections: '
+                f'{available_list}. Please retry with one or more of these sections or use the '
+                'read_documentation tool instead to get the full document content.'
+            )
+        raise ValueError(
+            'This document does not contain subsections. Please use the read_documentation '
+            'tool instead to get the full document content.'
+        )
+
+    result = '\n\n'.join(matched_blocks)
+
+    if len(found_sections) < len(section_titles):
+        missing = [t.strip() for t in section_titles if t.strip() not in found_sections]
+        missing_list = ', '.join(f'"{t}"' for t in missing)
+        result += (
+            f'\n\n> **Note**: The following requested sections were not found: {missing_list}'
+        )
+
+    return result
 
 
 def truncate_large_tables(

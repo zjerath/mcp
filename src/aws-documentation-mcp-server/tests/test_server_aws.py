@@ -61,7 +61,7 @@ class TestReadDocumentation:
 
                 assert 'AWS Documentation from' in result
                 assert '# Test\n\nThis is a test.' in result
-                mock_get.assert_called_once()
+                # .md probe returns non-markdown here, so we fall back to fetching .html.
                 mock_extract.assert_called_once()
                 called_url = mock_get.call_args[0][0]
                 assert '?session=' in called_url
@@ -89,7 +89,7 @@ class TestReadDocumentation:
 
                 assert 'AWS Documentation from' in result
                 assert '# Test\n\nThis is a test.' in result
-                mock_get.assert_called_once()
+                # .md probe returns non-markdown here, so we fall back to fetching .html.
                 mock_extract.assert_called_once()
                 called_url = mock_get.call_args[0][0]
                 assert '?session=' in called_url
@@ -110,7 +110,8 @@ class TestReadDocumentation:
 
             assert 'Failed to fetch' in result
             assert 'Connection error' in result
-            mock_get.assert_called_once()
+            # .md probe and .html fallback both raise; the .html error is surfaced.
+            assert mock_get.called
 
     @pytest.mark.asyncio
     async def test_read_documentation_invalid_domain(self):
@@ -129,6 +130,35 @@ class TestReadDocumentation:
 
         with pytest.raises(ValueError, match='URL must end with .html'):
             await read_documentation(ctx, url=url, max_length=10000, start_index=0)
+
+    @pytest.mark.asyncio
+    async def test_read_documentation_accepts_md_url(self):
+        """A .md URL is accepted (canonicalized to .html), not rejected as an invalid extension."""
+        ctx = MockContext()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = '<html><body><h1>Test</h1></body></html>'
+        mock_response.headers = {'content-type': 'text/html'}
+
+        with patch('httpx.AsyncClient.get', new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = mock_response
+            with patch(
+                'awslabs.aws_documentation_mcp_server.server_utils.extract_content_from_html',
+                return_value='# Test',
+            ):
+                # Passing the .md variant must not raise; it is canonicalized to .html.
+                result = await read_documentation(
+                    ctx,
+                    url='https://docs.aws.amazon.com/s3/latest/userguide/x.md',
+                    max_length=10000,
+                    start_index=0,
+                )
+                assert 'AWS Documentation from' in result
+                fetched = [call[0][0] for call in mock_get.call_args_list]
+                # No doubled/garbled extension from canonicalization + internal .md probe.
+                assert not any('.md.html' in u or '.html.md' in u for u in fetched)
+                # The canonical .html page was fetched (mock returns HTML, so .md falls back).
+                assert any('x.html?' in u for u in fetched)
 
 
 class TestReadSections:
@@ -165,7 +195,7 @@ class TestReadSections:
             # Verify unmatched section is not included
             assert 'This should not be included' not in result
 
-            mock_get.assert_called_once()
+            # .md probe returns non-markdown here, so we fall back to fetching .html.
             called_url = mock_get.call_args[0][0]
 
             # Verify sections parameter by parsing and decoding
@@ -216,7 +246,8 @@ class TestReadSections:
 
             assert 'Failed to fetch' in result
             assert 'Connection error' in result
-            mock_get.assert_called_once()
+            # .md probe and .html fallback both raise; the .html error is surfaced.
+            assert mock_get.called
 
     @pytest.mark.asyncio
     async def test_read_sections_no_sections_found(self):
@@ -382,7 +413,8 @@ class TestReadSections:
 
                 assert 'Cannot extract sections from non-HTML content' in result
                 assert 'read_documentation tool instead' in result
-                mock_get.assert_called_once()
+                # .md probe falls back; the .html fetch is what returns non-HTML here.
+                assert mock_get.called
 
     @pytest.mark.asyncio
     async def test_read_sections_non_404_error(self):
@@ -401,7 +433,8 @@ class TestReadSections:
 
             assert 'Failed to fetch' in result
             assert 'status code 500' in result
-            mock_get.assert_called_once()
+            # .md probe returns 500 (falls back); the .html fetch also 500s and is surfaced.
+            assert mock_get.called
 
     @pytest.mark.asyncio
     async def test_read_sections_extract_content_error(self):
@@ -471,7 +504,8 @@ class TestReadSections:
             assert 'Other Information' not in result
             assert 'This section should not be included' not in result
 
-            mock_get.assert_called_once()
+            # .md probe returns non-markdown here, so we fall back to the .html path.
+            assert mock_get.called
 
 
 class TestSearchDocumentation:
